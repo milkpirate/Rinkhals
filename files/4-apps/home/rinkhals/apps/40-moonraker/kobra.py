@@ -3,19 +3,84 @@ import uuid
 import json
 import re
 import time
+import asyncio
+import socket
 import logging
 import subprocess
+import shlex
+import ast
+import random
 import paho.mqtt.client as paho
 
 from ..utils import Sentinel
 from .power import PowerDevice
+from ..common import WebRequest
+
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Union,
+    Optional,
+    Dict,
+    List,
+    TypeVar,
+    Mapping,
+    Callable,
+    Coroutine
+)
+FlexCallback = Callable[..., Optional[Coroutine]]
 
 
-def shell(command):
+def shell(command, log_result: bool = False):
+    """Execute shell command. Set log_result=True for debugging only."""
     result = subprocess.check_output(['sh', '-c', command])
     result = result.decode('utf-8').strip()
-    logging.info(f'Shell "{command}" => "{result}"')
+    if log_result:
+        logging.info(f'Shell "{command}" => "{result}"')
     return result
+
+
+def _read_env_from_tools() -> dict:
+    """
+    Read environment variables by sourcing tools.sh directly.
+    More efficient than spawning a Python subprocess.
+    """
+    try:
+        # Source tools.sh and print only the vars we need
+        cmd = '. /useremain/rinkhals/.current/tools.sh && echo "$KOBRA_MODEL_ID|$KOBRA_MODEL_CODE|$KOBRA_DEVICE_ID"'
+        result = subprocess.check_output(['sh', '-c', cmd], stderr=subprocess.DEVNULL)
+        parts = result.decode('utf-8').strip().split('|')
+        if len(parts) == 3:
+            return {
+                'KOBRA_MODEL_ID': parts[0],
+                'KOBRA_MODEL_CODE': parts[1],
+                'KOBRA_DEVICE_ID': parts[2]
+            }
+    except:
+        pass
+    return {}
+
+
+def _find_pid_by_name(process_name: str) -> int:
+    """
+    Find PID by process name using /proc instead of subprocess.
+    Much more efficient than 'ps | grep'.
+    """
+    try:
+        for pid_dir in os.listdir('/proc'):
+            if not pid_dir.isdigit():
+                continue
+            try:
+                cmdline_path = f'/proc/{pid_dir}/cmdline'
+                with open(cmdline_path, 'r') as f:
+                    cmdline = f.read()
+                if process_name in cmdline:
+                    return int(pid_dir)
+            except (IOError, OSError):
+                continue
+    except:
+        pass
+    return None
 
 
 class Kobra:
@@ -29,6 +94,7 @@ class Kobra:
     # MQTT states
     mqtt_print_report = False
     mqtt_print_error = None
+    mqtt_print_error_code = None
 
     # Cache
     _goklipper_next_check = 0
@@ -37,19 +103,28 @@ class Kobra:
     _remote_mode = None
     _total_layer = 0
     _states_cache = []
+    _exclude_object_current_file = None
+    _exclude_object_objects = None
+    _exclude_object_force_end_task = None
+    _exclude_object_last_force_end_key = None
+
+    # GCode handlers
+    gcode_handlers: dict[str, FlexCallback] = {}
+    status_patchers: List[Callable[[dict], dict]] = []
+    print_data_patchers: List[Callable[[dict], dict]] = []
 
     def __init__(self, config):
         self.server = config.get_server()
         self.power = self.server.load_component(self.server.config, 'power')
 
         # Extract environment values from the printer
+        # Optimized: Use direct shell echo instead of spawning Python subprocess
         try:
-            environment = shell(f'. /useremain/rinkhals/.current/tools.sh && python -c "import os, json; print(json.dumps(dict(os.environ)))"')
-            environment = json.loads(environment)
+            environment = _read_env_from_tools()
 
-            self.KOBRA_MODEL_ID = environment['KOBRA_MODEL_ID']
-            self.KOBRA_MODEL_CODE = environment['KOBRA_MODEL_CODE']
-            self.KOBRA_DEVICE_ID = environment['KOBRA_DEVICE_ID']
+            self.KOBRA_MODEL_ID = environment.get('KOBRA_MODEL_ID')
+            self.KOBRA_MODEL_CODE = environment.get('KOBRA_MODEL_CODE')
+            self.KOBRA_DEVICE_ID = environment.get('KOBRA_DEVICE_ID')
             
             def load_tool_function(function_name):
                 def tool_function(*args):
@@ -71,14 +146,18 @@ class Kobra:
         logging.info('Starting Kobra patching...')
 
         self.patch_status_updates()
+        self.patch_gcode_handler()
         self.patch_network_interfaces()
+        self.patch_machine_power_actions()
         self.patch_spoolman()
         self.patch_simplyprint()
         self.patch_mqtt_print()
+        self.patch_exclude_object()
         self.patch_bed_mesh()
         self.patch_objects_list()
         self.patch_mainsail()
         self.patch_k2p_bug()
+        self.patch_ace_flush_control()
 
         logging.info('Completed Kobra patching! Yay!')
 
@@ -87,8 +166,8 @@ class Kobra:
 
     async def component_init(self):
 
-        if self.KOBRA_MODEL_CODE == 'K3':
-            # Add camera and head lights power devices
+        if self.KOBRA_MODEL_CODE in ('K3', 'K3M', 'K3V2'):
+            # Add camera and head lights power devices for K3, K3 Max and K3 V2
             config = self.server.config.read_supplemental_dict({
                 'power camera_light': {
                     'type': 'shell',
@@ -108,7 +187,7 @@ class Kobra:
             await self.power.add_device('camera_light', ShellPowerDevice(config.getsection('power camera_light')))
             await self.power.add_device('head_light', ShellPowerDevice(config.getsection('power head_light')))
 
-        elif self.KOBRA_MODEL_CODE == 'KS1':
+        elif self.KOBRA_MODEL_CODE == 'KS1' or self.KOBRA_MODEL_CODE == 'KS1M':
             # Add camera and head lights power devices
             config = self.server.config.read_supplemental_dict({
                 'power chamber_light': {
@@ -124,9 +203,9 @@ class Kobra:
 
     def is_goklipper_running(self):
         if time.time() < self._goklipper_next_check:
-            return self._goklipper_pid != None
+            return self._goklipper_pid is not None
 
-        if self._goklipper_pid != None:
+        if self._goklipper_pid is not None:
             try:
                 os.kill(self._goklipper_pid, 0)
             except:
@@ -134,14 +213,13 @@ class Kobra:
                 self._goklipper_pid = None
 
         if not self._goklipper_pid:
-            self._goklipper_pid = subprocess.check_output(['sh', '-c', "ps | grep gklib | grep -v grep | head -n 1 | awk '{print $1}'"])
-            self._goklipper_pid = self._goklipper_pid.decode('utf-8').strip()
-            self._goklipper_pid = int(self._goklipper_pid) if self._goklipper_pid else None
+            # Optimized: Use /proc directly instead of subprocess 'ps | grep'
+            self._goklipper_pid = _find_pid_by_name('gklib')
             if self._goklipper_pid:
                 logging.info(f'[Kobra] Found GoKlipper process (PID: {self._goklipper_pid})')
 
         self._goklipper_next_check = time.time() + 5
-        return self._goklipper_pid != None
+        return self._goklipper_pid is not None
 
     def get_remote_mode(self):
         if time.time() < self._remote_mode_next_check:
@@ -173,67 +251,432 @@ class Kobra:
         vibration_compensation = self.get_app_property('40-moonraker', 'mqtt_print_vibration_compensation').lower() == 'true'
         flow_calibration = self.get_app_property('40-moonraker', 'mqtt_print_flow_calibration').lower() == 'true'
 
-        payload = f"""{{
-            "type": "print",
-            "action": "start",
-            "msgid": "{uuid.uuid4()}",
-            "timestamp": {round(time.time() * 1000)},
-            "data": {{
-                "taskid": "-1",
-                "filename": "{file}",
-                "filetype": 1,
-                "task_settings": {{
-                    "auto_leveling": {'1' if auto_leveling else '0'},
-                    "vibration_compensation": {'1' if vibration_compensation else '0'},
-                    "flow_calibration": {'1' if flow_calibration else '0'}
-                }}
-            }}
-        }}"""
+        max_attempts = 2
+        
+        # payload = f"""{{
+        #     "type": "print",
+        #     "action": "start",
+        #     "msgid": "{uuid.uuid4()}",
+        #     "timestamp": {round(time.time() * 1000)},
+        #     "data": {{
+        #         "taskid": "-1",
+        #         "filename": "{file}",
+        #         "filetype": 1,
+        #         "task_settings": {{
+        #             "auto_leveling": {'1' if auto_leveling else '0'},
+        #             "vibration_compensation": {'1' if vibration_compensation else '0'},
+        #             "flow_calibration": {'1' if flow_calibration else '0'}
+        #         }}
+        #     }}
+        # }}"""
 
-        self.mqtt_print_report = False
-        self.mqtt_print_error = None
+        for attempt in range(1, max_attempts + 1):
+            print_request = {
+                'type': 'print',
+                'action': 'start',
+                'msgid': str(uuid.uuid4()),
+                'timestamp': int(time.time() * 1000),
+                'data': {
+                    'filename': file,
+                    'filepath': '/',
+                    'taskid': str(random.randint(0, 1000000)),
+                    'task_mode': 1,
+                    'filetype': 1,
+                    'task_settings': {
+                        'auto_leveling': 1 if auto_leveling else 0,
+                        'vibration_compensation': 1 if vibration_compensation else 0,
+                        'flow_calibration': 1 if flow_calibration else 0
+                    }
+                }
+            }
+
+            print_data = print_request["data"]
+
+            for patcher in self.print_data_patchers:
+                print_data = patcher(print_data)
+
+            print_request["data"] = print_data
+
+            logging.info(f'[Kobra] print data : {json.dumps(print_data)}')
+
+            payload = json.dumps(print_request)
+
+            self.mqtt_print_report = False
+            self.mqtt_print_error = None
+            self.mqtt_print_error_code = None
+
+            def mqtt_on_connect(client, userdata, flags, reason_code, properties):
+                client.subscribe(f'anycubic/anycubicCloud/v1/printer/public/{self.KOBRA_MODEL_ID}/{self.KOBRA_DEVICE_ID}/print/report')
+                client.publish(f'anycubic/anycubicCloud/v1/slicer/printer/{self.KOBRA_MODEL_ID}/{self.KOBRA_DEVICE_ID}/print', payload=payload, qos=1)
+
+            def mqtt_on_message(client, userdata, msg):
+                logging.debug(f'Received MQTT print report: {str(msg.payload)}')
+
+                payload = json.loads(msg.payload)
+                state = str(payload['state'])
+                logging.info(f'Received MQTT print state: {state}')
+
+                if state == 'failed' or state == 'stoped': # not 'heating', not 'printing', not 'leveling'
+                    code = payload.get('code')
+                    try:
+                        code = int(code)
+                    except:
+                        pass
+
+                    self.mqtt_print_error_code = code
+                    if code and code == 10107:
+                        message = 'Filament broken. Please load new filament. (code 10107)'
+                    else:
+                        message = str(payload['msg']) + (f' (code {code})' if code else '')
+                    self.mqtt_print_error = message
+
+                self.mqtt_print_report = True
+
+            client = paho.Client(protocol = paho.MQTTv5)
+            client.on_connect = mqtt_on_connect
+            client.on_message = mqtt_on_message
+
+            client.username_pw_set(self.MQTT_USERNAME, self.MQTT_PASSWORD)
+            client.connect('127.0.0.1', 2883)
+
+            timeout = time.time() + 30
+            while not self.mqtt_print_report:
+                if time.time() > timeout:
+                    self.mqtt_print_error = f'Timeout while trying to print {file}'
+                    break
+                client.loop(timeout = 0.25)
+
+            client.disconnect()
+
+            if self.mqtt_print_error and self.mqtt_print_error_code == 10101 and attempt < max_attempts:
+                logging.warning('[Kobra] Print start rejected with code 10101 (task still active). Retrying once...')
+                time.sleep(1.5)
+                continue
+
+            if self.mqtt_print_error:
+                message = f'Error while trying to print: {str(self.mqtt_print_error)}'
+                logging.error(message)
+                raise self.server.error(message)
+
+            return
+
+    def mqtt_stop_print(self):
+        logging.info('Trying to cancel current print using MQTT...')
+
+        payload = json.dumps({
+            'type': 'print',
+            'action': 'stop',
+            'msgid': str(uuid.uuid4()),
+            'timestamp': int(time.time() * 1000),
+            'data': {
+                'taskid': '-1'
+            }
+        })
+
+        mqtt_publish_done = False
 
         def mqtt_on_connect(client, userdata, flags, reason_code, properties):
-            client.subscribe(f'anycubic/anycubicCloud/v1/printer/public/{self.KOBRA_MODEL_ID}/{self.KOBRA_DEVICE_ID}/print/report')
-            client.publish(f'anycubic/anycubicCloud/v1/slicer/printer/{self.KOBRA_MODEL_ID}/{self.KOBRA_DEVICE_ID}/print', payload=payload, qos=1)
-
-        def mqtt_on_message(client, userdata, msg):
-            logging.debug(f'Received MQTT print report: {str(msg.payload)}')
-
-            payload = json.loads(msg.payload)
-            state = str(payload['state'])
-            logging.info(f'Received MQTT print state: {state}')
-
-            if state == 'failed' or state == 'stoped': # not 'heating', not 'printing', not 'leveling'
-                code = payload.get('code')
-                if code and code == 10107:
-                    message = 'Filament broken. Please load new filament. (code 10107)'
-                else:
-                    message = str(payload['msg']) + (f' (code {code})' if code else '')
-                self.mqtt_print_error = message
-
-            self.mqtt_print_report = True
+            nonlocal mqtt_publish_done
+            client.publish(
+                f'anycubic/anycubicCloud/v1/slicer/printer/{self.KOBRA_MODEL_ID}/{self.KOBRA_DEVICE_ID}/print',
+                payload=payload,
+                qos=1
+            )
+            mqtt_publish_done = True
 
         client = paho.Client(protocol = paho.MQTTv5)
         client.on_connect = mqtt_on_connect
-        client.on_message = mqtt_on_message
 
         client.username_pw_set(self.MQTT_USERNAME, self.MQTT_PASSWORD)
         client.connect('127.0.0.1', 2883)
 
-        timeout = time.time() + 30
-        while not self.mqtt_print_report:
+        timeout = time.time() + 5
+        while not mqtt_publish_done:
             if time.time() > timeout:
-                self.mqtt_print_error = f'Timeout while trying to print {file}'
                 break
             client.loop(timeout = 0.25)
 
         client.disconnect()
 
-        if self.mqtt_print_error:
-            message = f'Error while trying to print: {str(self.mqtt_print_error)}'
-            logging.error(message)
-            raise self.server.error(message)
+        if not mqtt_publish_done:
+            raise self.server.error('Timeout while trying to cancel print over MQTT')
+
+    def _set_exclude_object_file(self, file_path: Optional[str]):
+        if not file_path:
+            return
+
+        prefix = '/useremain/app/gk/gcodes/'
+        if file_path.startswith(prefix):
+            file_path = file_path.replace(prefix, '', 1)
+
+        if file_path != self._exclude_object_current_file:
+            logging.info(f'[Kobra] Tracking exclude_object file: {file_path}')
+            self._exclude_object_current_file = file_path
+            self._exclude_object_objects = None
+
+    def _get_exclude_object_objects(self, source_info: Optional[dict] = None) -> List[dict]:
+        if self._exclude_object_objects is not None:
+            return self._exclude_object_objects
+
+        objects: List[dict] = []
+        file_path = self._exclude_object_current_file
+
+        if file_path:
+            absolute_path = os.path.join('/userdata/app/gk/printer_data/gcodes', file_path.lstrip('/'))
+            if os.path.isfile(absolute_path):
+                try:
+                    with open(absolute_path, 'r', encoding='utf-8', errors='replace') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            if line.startswith('EXCLUDE_OBJECT_START') and objects:
+                                break
+
+                            if not line.startswith('EXCLUDE_OBJECT_DEFINE '):
+                                continue
+
+                            name_match = re.search(r'NAME=("[^"]+"|\S+)', line)
+                            if not name_match:
+                                continue
+
+                            name = name_match.group(1)
+                            if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+                                name = name[1:-1]
+
+                            obj = { 'name': name }
+
+                            center_match = re.search(r'CENTER=([0-9.+\-]+(?:,[0-9.+\-]+)+)', line)
+                            if center_match:
+                                try:
+                                    obj['center'] = [float(v) for v in center_match.group(1).split(',')]
+                                except:
+                                    pass
+
+                            polygon_match = re.search(r'POLYGON=(\[\[.*\]\])', line)
+                            if polygon_match:
+                                try:
+                                    obj['polygon'] = json.loads(polygon_match.group(1))
+                                except:
+                                    pass
+
+                            objects.append(obj)
+                except:
+                    logging.exception(f'[Kobra] Failed to parse exclude_object definitions from {absolute_path}')
+
+        if not objects and source_info and isinstance(source_info, dict):
+            models = source_info.get('models')
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict) and model.get('name'):
+                        objects.append({ 'name': str(model['name']) })
+
+        if objects:
+            logging.info(f'[Kobra] Injected {len(objects)} exclude_object definitions')
+
+        self._exclude_object_objects = objects
+        return objects
+
+    def _normalize_exclude_object_name(self, name: str, objects: Optional[List[dict]] = None) -> str:
+        if not name:
+            return name
+
+        if objects is None:
+            objects = self._get_exclude_object_objects()
+
+        object_names = {
+            str(obj.get('name')).lower(): str(obj.get('name'))
+            for obj in objects
+            if isinstance(obj, dict) and obj.get('name')
+        }
+
+        return object_names.get(name.lower(), name)
+
+    def _normalize_exclude_object_script(self, script: str) -> str:
+        if not script:
+            return script
+
+        script_stripped = script.strip()
+        if not script_stripped.upper().startswith('EXCLUDE_OBJECT'):
+            return script
+
+        name_match = re.search(r'NAME=("[^"]+"|\S+)', script_stripped, re.IGNORECASE)
+        if not name_match:
+            return script
+
+        name_raw = name_match.group(1)
+        name = name_raw[1:-1] if len(name_raw) >= 2 and name_raw[0] == '"' and name_raw[-1] == '"' else name_raw
+
+        normalized = self._normalize_exclude_object_name(name)
+        if normalized == name:
+            return script
+
+        replacement = f'NAME={normalized}'
+        script_new = re.sub(r'NAME=("[^"]+"|\S+)', replacement, script_stripped, count=1, flags=re.IGNORECASE)
+        logging.info(f'[Kobra] Normalized EXCLUDE_OBJECT name: {name} -> {normalized}')
+        return script_new
+
+    def _normalize_exclude_object_status(self, exclude_status: dict, objects: List[dict]):
+        if not isinstance(exclude_status, dict):
+            return
+
+        object_names = {
+            str(obj.get('name')).lower(): str(obj.get('name'))
+            for obj in objects
+            if isinstance(obj, dict) and obj.get('name')
+        }
+
+        current_object = exclude_status.get('current_object')
+        if isinstance(current_object, str) and current_object:
+            exclude_status['current_object'] = object_names.get(current_object.lower(), current_object)
+
+        excluded_objects = exclude_status.get('excluded_objects')
+        if isinstance(excluded_objects, list):
+            normalized = []
+            seen = set()
+            for name in excluded_objects:
+                if not isinstance(name, str):
+                    continue
+                canonical = object_names.get(name.lower(), name)
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                normalized.append(canonical)
+            exclude_status['excluded_objects'] = normalized
+
+    def _exclude_object_socket_request(self, method: str, params: Optional[dict] = None) -> Optional[dict]:
+        if params is None:
+            params = {}
+
+        request_id = random.randint(1, 1000000)
+        payload = {
+            'method': method,
+            'params': params,
+            'id': request_id
+        }
+
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect('/tmp/unix_uds1')
+            sock.sendall((json.dumps(payload) + '\x03').encode('utf-8'))
+
+            chunks: List[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                if b'\x03' in data:
+                    break
+
+            if not chunks:
+                return None
+
+            raw = b''.join(chunks).split(b'\x03', 1)[0].decode('utf-8', errors='replace')
+            response = json.loads(raw)
+            if isinstance(response, dict) and response.get('id') == request_id:
+                return response
+        except Exception:
+            logging.exception(f'[Kobra] Native exclude_object request failed: {method}')
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        return None
+
+    def _native_get_excluded_objects(self) -> List[str]:
+        response = self._exclude_object_socket_request('exclude_object/get_objects', {})
+        if not isinstance(response, dict):
+            return []
+
+        result = response.get('result')
+        if not isinstance(result, dict):
+            return []
+
+        excluded = result.get('exclude_objects')
+        if not isinstance(excluded, list):
+            return []
+
+        return [name for name in excluded if isinstance(name, str) and name]
+
+    def _native_set_excluded_objects(self, excluded_objects: List[str]) -> bool:
+        sanitized: List[str] = []
+        seen = set()
+        for name in excluded_objects:
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            sanitized.append(name)
+
+        response = self._exclude_object_socket_request(
+            'exclude_object/set_objects',
+            { 'exclude_objects': sanitized }
+        )
+
+        return isinstance(response, dict) and 'result' in response
+
+    async def _force_end_excluded_object(self, object_name: str, trigger_key: tuple):
+        try:
+            klippy_apis = self.server.lookup_component('klippy_apis')
+
+            try:
+                await klippy_apis.run_gcode('EXCLUDE_OBJECT_END_NO_OBJ')
+                logging.warning(f'[Kobra] Forced end of excluded object segment: {object_name}')
+            except Exception:
+                logging.exception(f'[Kobra] Failed EXCLUDE_OBJECT_END_NO_OBJ for excluded object: {object_name}')
+        finally:
+            if self._exclude_object_last_force_end_key != trigger_key:
+                self._exclude_object_last_force_end_key = trigger_key
+            self._exclude_object_force_end_task = None
+
+    def _maybe_force_end_excluded_object(self, status: dict):
+        if not isinstance(status, dict):
+            return
+
+        exclude_status = status.get('exclude_object')
+        if not isinstance(exclude_status, dict):
+            return
+
+        current_object = exclude_status.get('current_object')
+        excluded_objects = exclude_status.get('excluded_objects')
+
+        if not isinstance(current_object, str) or not current_object:
+            return
+
+        if not isinstance(excluded_objects, list) or current_object not in excluded_objects:
+            return
+
+        print_stats = status.get('print_stats')
+        if not isinstance(print_stats, dict) or str(print_stats.get('state', '')).lower() != 'printing':
+            return
+
+        layer = None
+        info = print_stats.get('info')
+        if isinstance(info, dict):
+            layer = info.get('current_layer')
+
+        file_path = self._exclude_object_current_file or print_stats.get('filename')
+        trigger_key = (file_path, layer, current_object)
+
+        if self._exclude_object_last_force_end_key == trigger_key:
+            return
+
+        if self._exclude_object_force_end_task is not None and not self._exclude_object_force_end_task.done():
+            return
+
+        logging.warning(f'[Kobra] Excluded object still active, forcing segment end: {current_object} (layer={layer})')
+        self._exclude_object_force_end_task = self.server.get_event_loop().create_task(
+            self._force_end_excluded_object(current_object, trigger_key)
+        )
 
 
     def patch_status(self, status):
@@ -253,8 +696,31 @@ class Kobra:
                         state = 'printing'
                     if state.lower() == 'onpause':
                         state = 'paused'
+                    if state.lower() in ['complete', 'completed', 'print_complete', 'finished', 'finish', 'done']:
+                        state = 'complete'
 
-                    # Ensures same string memory location for Moonraker job_state check (https://github.com/jbatonnet/Rinkhals/issues/118#issuecomment-2980916709)
+                    # Debounce GoKlipper's standby state due to race condition at end of print (#445)
+                    # GoKlipper emits "standby" then "complete" 1-2 seconds later, causing Moonraker to report "cancelled"
+                    if state.lower() == 'standby' and getattr(self, '_last_tracked_state', None) == 'printing':
+                        state = 'printing' # Keep it printing for now
+                        
+                        async def _apply_delayed_standby():
+                            import asyncio
+                            await asyncio.sleep(2.5)
+                            if getattr(self, '_last_tracked_state', None) == 'printing':
+                                setattr(self, '_last_tracked_state', 'standby')
+                                import time
+                                klippy_conn = self.server.lookup_component("klippy_connection", None)
+                                if klippy_conn:
+                                    klippy_conn._process_status_update(time.time(), {'print_stats': {'state': 'standby'}})
+
+                        if not getattr(self, '_delayed_standby_task', None) or getattr(self, '_delayed_standby_task').done():
+                            # Run the debouncer
+                            setattr(self, '_delayed_standby_task', self.server.get_event_loop().create_task(_apply_delayed_standby()))
+
+                    setattr(self, '_last_tracked_state', state)
+
+                    # Ensures same string memory location for Moonraker job_state check (https://github.com/rinkhals-community/Rinkhals/issues/118#issuecomment-2980916709)
                     if state not in self._states_cache:
                         self._states_cache.append(state)
                     state = [ s for s in self._states_cache if s == state ][0]
@@ -268,6 +734,7 @@ class Kobra:
                     status['idle_timeout']['state'] = state
 
                 if 'filename' in status['print_stats']:
+                    self._set_exclude_object_file(status['print_stats']['filename'])
                     # Remove path prefix from filename
                     status['print_stats']['filename'] = status['print_stats']['filename'].replace('/useremain/app/gk/gcodes/', '')
 
@@ -289,11 +756,37 @@ class Kobra:
                     status['print_stats']['info']['total_layer'] = self._total_layer
                 
                 if 'file_path' in status['virtual_sdcard']:
+                    self._set_exclude_object_file(status['virtual_sdcard']['file_path'])
                     # Remove path prefix from file path
                     status['virtual_sdcard']['file_path'] = status['virtual_sdcard']['file_path'].replace('/useremain/app/gk/gcodes/', '')
 
+                if 'exclude_object' in status:
+                    objects = self._get_exclude_object_objects(status['virtual_sdcard'].get('source_info'))
+                    if objects and ('objects' not in status['exclude_object'] or not status['exclude_object']['objects']):
+                        status['exclude_object']['objects'] = objects
+                    if objects:
+                        self._normalize_exclude_object_status(status['exclude_object'], objects)
+
+            elif 'exclude_object' in status:
+                objects = self._get_exclude_object_objects()
+                if objects and ('objects' not in status['exclude_object'] or not status['exclude_object']['objects']):
+                    status['exclude_object']['objects'] = objects
+                if objects:
+                    self._normalize_exclude_object_status(status['exclude_object'], objects)
+
+        for patcher in self.status_patchers:
+            status = patcher(status)
+
+        if self.is_goklipper_running():
+            self._maybe_force_end_excluded_object(status)
+
         return status
 
+    def register_status_patcher(self, patcher: Callable[[dict], dict]):
+        self.status_patchers.append(patcher)
+
+    def register_print_data_patcher(self, patcher: Callable[[dict], dict]):
+        self.print_data_patchers.append(patcher)
 
     def patch_status_updates(self):
         from .klippy_apis import KlippyAPI
@@ -347,6 +840,24 @@ class Kobra:
         logging.debug(f'  Before: {KlippyRequest.set_result}')
         setattr(KlippyRequest, 'set_result', wrap_set_result(KlippyRequest.set_result))
         logging.debug(f'  After: {KlippyRequest.set_result}')
+        
+        def wrap_request(original_request):
+            async def request(me, web_request: WebRequest) -> Any:
+                rpc_method = web_request.get_endpoint()
+                logging.debug(f'Wrap request method: {rpc_method}')
+                result = await original_request(me, web_request)
+                logging.debug(f'Wrap request method {rpc_method} result type: {type(result)}')
+                if result and isinstance(result, dict):
+                    logging.debug(f'Wrap request method {rpc_method} result: {json.dumps(result)}')
+                if result and isinstance(result, dict) and 'status' in result:
+                    result['status'] = self.patch_status(result['status'])
+                    logging.debug(f'Wrap request method {rpc_method} result status: {json.dumps(result)}')
+                return result
+            return request
+
+        logging.debug(f'  Before: {KlippyConnection.request}')
+        setattr(KlippyConnection, 'request', wrap_request(KlippyConnection.request))
+        logging.debug(f'  After: {KlippyConnection.request}')
 
     def patch_network_interfaces(self):
         from .machine import Machine
@@ -360,6 +871,44 @@ class Kobra:
         logging.debug(f'  Before: {Machine._parse_network_interfaces}')
         setattr(Machine, '_parse_network_interfaces', _parse_network_interfaces)
         logging.debug(f'  After: {Machine._parse_network_interfaces}')
+
+    async def _run_native_machine_action(self, action: str):
+        await asyncio.sleep(0.1)
+
+        try:
+            subprocess.Popen(
+                ['sh', '-c', f'sync && /sbin/{action}'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            logging.exception(f'[Kobra] Failed to launch native host {action}')
+
+    def _schedule_native_machine_action(self, action: str):
+        logging.info(f'[Kobra] Scheduling native host {action}')
+        self.server.get_event_loop().create_task(self._run_native_machine_action(action))
+
+    def patch_machine_power_actions(self):
+        from .machine import Machine
+
+        logging.info('> Patching machine exec_sudo_command handling...')
+
+        original_exec_sudo_command = Machine.exec_sudo_command
+
+        async def wrap_exec_sudo_command(me, command: str, tries: int = 1, timeout=2.):
+            if command in ("systemctl reboot", "reboot", "/sbin/reboot"):
+                logging.info('[Kobra] Intercepting sudo command for reboot')
+                self._schedule_native_machine_action("reboot")
+                return ""
+            elif command in ("systemctl poweroff", "systemctl halt", "poweroff", "halt", "/sbin/poweroff", "/sbin/halt"):
+                logging.info('[Kobra] Intercepting sudo command for shutdown')
+                self._schedule_native_machine_action("poweroff")
+                return ""
+            
+            return await original_exec_sudo_command(me, command, tries, timeout)
+            
+        Machine.exec_sudo_command = wrap_exec_sudo_command
+        logging.info('> Patched Machine.exec_sudo_command')
 
     def patch_spoolman(self):
         from .spoolman import SpoolManager
@@ -386,7 +935,8 @@ class Kobra:
                 result = original_get_klippy_info(me)
                 if self.is_goklipper_running():
                     result['klipper_path'] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
-                    logging.info('[Kobra] Injected klipper_path')
+                    result['config_file'] = '/userdata/app/gk/printer_data/config/printer.generated.cfg'
+                    logging.info('[Kobra] Injected klipper_path and config_file')
                 return result
             return get_klippy_info
 
@@ -396,26 +946,174 @@ class Kobra:
         setattr(Server, 'get_klippy_info', wrap_get_klippy_info(Server.get_klippy_info))
         logging.debug(f'  After: {Server.get_klippy_info}')
 
-    def patch_mqtt_print(self):
-        from .klippy_apis import KlippyAPI
+    def register_gcode_handler(self, cmd, callback: FlexCallback):
+        logging.info(f'> Registering gcode handler for {cmd}...')
+        self.gcode_handlers[cmd.upper()] = callback
 
-        def wrap_run_gcode(original_run_gcode):
-            async def run_gcode(me, script, default = Sentinel.MISSING):
-                if self.is_goklipper_running() and script.startswith('SDCARD_PRINT_FILE'):
-                    self._total_layer = 0
-                    filename = re.search("FILENAME=\"([^\"]+)\"$", script)
-                    filename = filename[1] if filename else None
-                    if filename and self.is_using_mqtt():
-                        self.mqtt_print_file(filename)
-                        return None
-                return await original_run_gcode(me, script, default)
+    def patch_gcode_handler(self):
+        from .klippy_apis import KlippyAPI
+        from .klippy_connection import KlippyConnection
+
+        async def handle_gcode(me, script, delegate_run_gcode: Callable[[], Coroutine]):
+            parts = [s.strip() for s in shlex.split(script.strip()) if s.strip()]
+            logging.debug(f"hook on gcode received: {json.dumps(parts)}")
+
+            # Split multi-command lines (e.g., "CMD1 ARG1=X CMD2 ARG2=Y")
+            # Find indices where a part is a registered handler (indicates new command)
+            handler_indices = [0]  # First part is always a command
+            for i, part in enumerate(parts[1:], 1):
+                if part in self.gcode_handlers and '=' not in part:
+                    handler_indices.append(i)
+
+            # If multiple commands detected, execute them sequentially
+            if len(handler_indices) > 1:
+                logging.debug(f"Multiple commands detected in one line: {handler_indices}")
+                last_result = None
+                for idx, start_idx in enumerate(handler_indices):
+                    end_idx = handler_indices[idx + 1] if idx + 1 < len(handler_indices) else len(parts)
+                    sub_parts = parts[start_idx:end_idx]
+                    sub_script = ' '.join(sub_parts)
+                    logging.debug(f"Executing sub-command: {sub_script}")
+                    last_result = await handle_gcode(me, sub_script, delegate_run_gcode)
+                return last_result
+
+            cmd = parts[0]
+
+            logging.debug(f"hook on gcode cmd: {cmd}")
+            handlers = self.gcode_handlers.keys()
+            # join handlers
+            handlers = ', '.join(handlers)
+            logging.debug(f"hook on gcode handlers: {handlers}")
+
+            if cmd in self.gcode_handlers:
+                logging.debug(f"hook on gcode cmd found: {cmd}")
+                args = {}
+                for part in parts[1:]:
+                    if '=' in part:
+                        key, value = part.split('=', 1)
+                        args[key] = value
+                    else:
+                        args[part] = None
+
+                logging.debug(f"hook on gcode args: {json.dumps(args)}")
+                result = await self.gcode_handlers[cmd](args, delegate_run_gcode)
+                result_str = "None" if result is None else "Any"
+                logging.debug(f"hook on gcode result: {result_str}")
+
+                if result is None:
+                    return None
+
+                return result
+            else:
+                logging.debug(f"hook on gcode cmd not found: {cmd}")
+                return await delegate_run_gcode()
+
+        def wrap_request(original_request: KlippyConnection.request):
+            async def request(me: KlippyConnection, web_request: WebRequest):
+                logging.debug(f"hook on request")
+
+                rpc_method = web_request.get_endpoint()
+                if rpc_method == "gcode/script":
+
+                    script = web_request.get_str('script', "")
+                    if script:
+                        normalized_script = self._normalize_exclude_object_script(script)
+                        if normalized_script != script:
+                            web_request.get_args()['script'] = normalized_script
+                            script = normalized_script
+
+                        async def delegate_run_gcode():
+                            return await original_request(me, web_request)
+
+                        return await handle_gcode(me, script, delegate_run_gcode)
+
+                return await original_request(me, web_request)
+
+            return request
+
+        def wrap_run_gcode(original_run_gcode: KlippyAPI.run_gcode):
+            async def run_gcode(me: KlippyAPI, script: str, default: Any = Sentinel.MISSING):
+                logging.debug(f"hook on run gcode: {script}")
+
+                async def delegate_run_gcode():
+                    return await original_run_gcode(me, script, default)
+
+                return await handle_gcode(me, script, delegate_run_gcode)
+
             return run_gcode
 
-        logging.info('> Send prints to MQTT...')
+        logging.info('> Adding gcode handler...')
+
+        logging.debug(f'  Before: {KlippyConnection.request}')
+        setattr(KlippyConnection, 'request', wrap_request(KlippyConnection.request))
+        logging.debug(f'  After: {KlippyConnection.request}')
 
         logging.debug(f'  Before: {KlippyAPI.run_gcode}')
         setattr(KlippyAPI, 'run_gcode', wrap_run_gcode(KlippyAPI.run_gcode))
         logging.debug(f'  After: {KlippyAPI.run_gcode}')
+
+    def patch_mqtt_print(self):
+        async def handle_gcode_print_file(args: dict, delegate_run_gcode):
+            logging.info(f'[Kobra] Print file: {args}')
+            filename = args["FILENAME"] if "FILENAME" in args else None
+            if self.is_goklipper_running():
+                self._total_layer = 0
+                logging.info(f'[Kobra] Print file: {filename}')
+                
+                if filename and self.is_using_mqtt():
+                    logging.info(f'[Kobra] MQTT print file: {filename}')
+                    self.mqtt_print_file(filename)
+                    return None
+            
+            if filename:
+                logging.info(f'[Kobra] Not MQTT print file: {filename}')
+            else:
+                logging.info(f'[Kobra] No filename provided for not MQTT print')
+
+            return await delegate_run_gcode()
+
+        async def handle_gcode_cancel_print(args: dict, delegate_run_gcode):
+            logging.info(f'[Kobra] Cancel print requested: {args}')
+            if self.is_goklipper_running() and self.is_using_mqtt():
+                logging.info('[Kobra] MQTT cancel print')
+                self.mqtt_stop_print()
+                return None
+
+            return await delegate_run_gcode()
+
+        logging.info('> Send prints to MQTT...')
+        self.register_gcode_handler('SDCARD_PRINT_FILE', handle_gcode_print_file)
+        self.register_gcode_handler('CANCEL_PRINT', handle_gcode_cancel_print)
+
+    def patch_exclude_object(self):
+        async def handle_gcode_exclude_object(args: dict, delegate_run_gcode):
+            if not self.is_goklipper_running():
+                return await delegate_run_gcode()
+
+            reset_requested = 'RESET' in args or 'CLEAR' in args
+            if reset_requested:
+                if self._native_set_excluded_objects([]):
+                    logging.warning('[Kobra] Cleared excluded objects via native endpoint')
+                    return None
+                return await delegate_run_gcode()
+
+            name = args.get('NAME')
+            if not name:
+                return await delegate_run_gcode()
+
+            normalized_name = self._normalize_exclude_object_name(str(name))
+            excluded_objects = self._native_get_excluded_objects()
+            if normalized_name not in excluded_objects:
+                excluded_objects.append(normalized_name)
+
+            if self._native_set_excluded_objects(excluded_objects):
+                logging.warning(f'[Kobra] Excluded object via native endpoint: {normalized_name}')
+                return None
+
+            return await delegate_run_gcode()
+
+        logging.info('> Routing EXCLUDE_OBJECT to native endpoint...')
+        self.register_gcode_handler('EXCLUDE_OBJECT', handle_gcode_exclude_object)
 
     def patch_bed_mesh(self):
         from .klippy_connection import KlippyConnection
@@ -483,13 +1181,13 @@ class Kobra:
                             'SAVE_CONFIG'
                         ]
 
-                        if self.KOBRA_MODEL_CODE != 'KS1':
+                        if self.KOBRA_MODEL_CODE != 'KS1' and self.KOBRA_MODEL_CODE != 'KS1M':
                             calibrate_script.remove('WIPE_ENTER')
                             calibrate_script.remove('WIPE_EXIT')
 
                         web_request.get_args()["script"] = '\n'.join(calibrate_script)
                     elif script.lower().startswith('bed_mesh_profile'):
-                        name = re.search('save=(\"(?:[^\"]+)\"|(?:[^\s]+))', script.lower())
+                        name = re.search(r'save=("(?:[^"]+)"|(?:[^\s]+))', script.lower())
                         if name and name[1] != 'default':
                             message = 'GoKlipper only support one default bed mesh'
                             logging.error(message)
@@ -585,7 +1283,6 @@ class Kobra:
                     logging.info('[Kobra] Injected objects list')
                     
                     objects = [
-                        "motion_report",
                         "gcode_macro t0",
                         "gcode_macro t1",
                         "gcode_macro t2",
@@ -594,6 +1291,7 @@ class Kobra:
                         "heaters",
                         "respond",
                         "display_status",
+                        "exclude_object",
                         "extruder",
                         "fan",
                         "gcode_move",
@@ -614,13 +1312,19 @@ class Kobra:
                         "bed_mesh \"default\"",
                         "idle_timeout"
                     ]
+
+                    # For KS1M: Do not expose motion_report to avoid GoKlipper panic:
+                    # "interface conversion: interface {} is chelper._Ctype_struct_pull_move, not *chelper._Ctype_struct_pull_movegoroutine"
+                    # For other models, insert motion_report at same position as before to avoid any regression
+                    if self.KOBRA_MODEL_CODE != 'KS1M':
+                        objects.insert(0, "motion_report")
                     
                     web_request.endpoint = 'gcode/help'
                     result = await original_request(me, web_request)
                     for gcode in result:
                         objects.append(f"gcode_macro {gcode}")
                     
-                    if self.KOBRA_MODEL_CODE == 'KS1':
+                    if self.KOBRA_MODEL_CODE == 'KS1' or self.KOBRA_MODEL_CODE == 'KS1M':
                         objects.append("fan_generic air_filter_fan")
                         objects.append("fan_generic box_fan")
 
@@ -640,11 +1344,37 @@ class Kobra:
         def wrap__request_standard(original__request_standard):
             async def _request_standard(me, web_request, timeout = None):
                 result = await original__request_standard(me, web_request, timeout)
-                if self.is_goklipper_running() and 'status' in result and 'configfile' in result['status'] and 'config' in result['status']['configfile']:
-                    logging.info('[Kobra] Injected Mainsail macros')
-                    result['status']['configfile']['config']['gcode_macro pause'] = {}
-                    result['status']['configfile']['config']['gcode_macro resume'] = {}
-                    result['status']['configfile']['config']['gcode_macro cancel_print'] = {}
+                if self.is_goklipper_running() and 'status' in result and 'configfile' in result['status']:
+                    configfile = result['status']['configfile']
+
+                    # Inject the pause/resume/cancel_print macros into configfile.config
+                    # so Mainsail's Print Status panel renders the corresponding buttons.
+                    if 'config' in configfile:
+                        logging.info('[Kobra] Injected Mainsail macros')
+                        configfile['config']['gcode_macro pause'] = {}
+                        configfile['config']['gcode_macro resume'] = {}
+                        configfile['config']['gcode_macro cancel_print'] = {}
+
+                    # Inject stepper_z.endstop_pin into configfile.settings so the
+                    # Mainsail Z-offset control renders during a print. GoKlipper's
+                    # configfile.settings.stepper_z does not include endstop_pin;
+                    # Mainsail's ZoffsetMixin.isEndstopProbe calls
+                    #   this.endstop_pin.replaceAll(' ', '')
+                    # which throws TypeError on null. Vue silently drops the entire
+                    # ZoffsetControl when the throw happens, so the Z-offset section
+                    # disappears the moment z_gcode_offset becomes non-zero (which
+                    # happens after LeviQ3 leveling completes).
+                    # Declaring "probe:z_virtual_endstop" makes Mainsail use the
+                    # Z_OFFSET_APPLY_PROBE save path, which GoKlipper does expose.
+                    settings = configfile.get('settings')
+                    if isinstance(settings, dict):
+                        stepper_z = settings.get('stepper_z')
+                        if isinstance(stepper_z, dict) and not stepper_z.get('endstop_pin'):
+                            stepper_z['endstop_pin'] = 'probe:z_virtual_endstop'
+                            logging.info(
+                                '[Kobra] Injected stepper_z.endstop_pin for Mainsail '
+                                'Z-offset control'
+                            )
                 return result
             return _request_standard
 
@@ -663,7 +1393,8 @@ class Kobra:
                 if self.is_goklipper_running():
                     result['klipper_path'] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
                     result['python_path'] = ''
-                    logging.info('[Kobra] Injected missing paths')
+                    result['config_file'] = '/userdata/app/gk/printer_data/config/printer.generated.cfg'
+                    logging.info('[Kobra] Injected missing paths and config_file')
                 return result
             return get_klippy_info
 
@@ -672,6 +1403,88 @@ class Kobra:
         logging.debug(f'  Before: {KlippyAPI.get_klippy_info}')
         setattr(KlippyAPI, 'get_klippy_info', wrap_get_klippy_info(KlippyAPI.get_klippy_info))
         logging.debug(f'  After: {KlippyAPI.get_klippy_info}')
+
+    def patch_ace_flush_control(self):
+        from .klippy_connection import KlippyConnection
+        import asyncio
+
+        async def handle_ace_flush_command(script_upper, script):
+            """Handle ACE flush control commands. Returns (handled, result)."""
+
+            if script_upper.startswith('SET_ACE_FLUSH_MULTIPLIER'):
+                import re
+                value_match = re.search(r'VALUE=([0-9.]+)', script, re.IGNORECASE)
+                if not value_match:
+                    logging.error('[ACE Flush] Missing VALUE parameter')
+                    return (True, None)
+
+                value = float(value_match.group(1))
+
+                # Validate range
+                if value < 0.0 or value > 3.0:
+                    logging.error(f'[ACE Flush] Invalid value {value}, must be 0.0-3.0')
+                    return (True, None)
+
+                # Call GoKlipper's filament_hub API via HTTP client
+                try:
+                    http_client = self.server.lookup_component('http_client')
+                    url = 'http://localhost:7125/printer/filament_hub/set_config'
+                    data = {'flush_multiplier': value}
+
+                    response = await http_client.post(url, body=json.dumps(data),
+                                                    headers={'Content-Type': 'application/json'})
+
+                    logging.info(f'[ACE Flush] Set flush_multiplier to {value} via HTTP API')
+                    self.server.send_event("server:gcode_response", f"// ACE flush_multiplier set to {value}")
+                    return (True, "ok")
+                except Exception as e:
+                    logging.error(f'[ACE Flush] Failed to call API: {e}')
+                    return (True, None)
+
+            elif script_upper == 'ACE_FLUSH_MINIMAL':
+                return await handle_ace_flush_command('SET_ACE_FLUSH_MULTIPLIER', 'SET_ACE_FLUSH_MULTIPLIER VALUE=0.1')
+
+            elif script_upper == 'ACE_FLUSH_NORMAL':
+                return await handle_ace_flush_command('SET_ACE_FLUSH_MULTIPLIER', 'SET_ACE_FLUSH_MULTIPLIER VALUE=1.0')
+
+            elif script_upper == 'ACE_FLUSH_MAXIMUM':
+                return await handle_ace_flush_command('SET_ACE_FLUSH_MULTIPLIER', 'SET_ACE_FLUSH_MULTIPLIER VALUE=3.0')
+
+            elif script_upper == 'GET_ACE_FLUSH_MULTIPLIER':
+                try:
+                    http_client = self.server.lookup_component('http_client')
+                    url = 'http://localhost:7125/printer/filament_hub/get_config'
+
+                    response = await http_client.get(url)
+                    data = response.json()
+                    value = data['result']['flush_multiplier']
+
+                    self.server.send_event("server:gcode_response", f"// ACE flush_multiplier: {value}")
+                    logging.info(f'[ACE Flush] Current flush_multiplier: {value}')
+                    return (True, "ok")
+                except Exception as e:
+                    logging.error(f'[ACE Flush] Failed to read config: {e}')
+                    return (True, None)
+
+            return (False, None)
+
+        def wrap_request(original_request):
+            async def request(me, web_request):
+                rpc_method = web_request.get_endpoint()
+                if self.is_goklipper_running() and rpc_method == "gcode/script":
+                    script = web_request.get_str('script', "")
+                    script_upper = script.strip().upper()
+
+                    # Check if it's an ACE flush control command
+                    handled, result = await handle_ace_flush_command(script_upper, script)
+                    if handled:
+                        return result
+
+                return await original_request(me, web_request)
+            return request
+
+        logging.info('> Adding ACE flush control macros...')
+        setattr(KlippyConnection, 'request', wrap_request(KlippyConnection.request))
 
 
 class ShellPowerDevice(PowerDevice):

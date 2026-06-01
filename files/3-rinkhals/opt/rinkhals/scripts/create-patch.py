@@ -1,5 +1,5 @@
 # From a Windows machine:
-#   docker run --rm -it -v .\files:/files -w /files/3-rinkhals/opt/rinkhals/patches ghcr.io/jbatonnet/rinkhals/build python3 ../scripts/create-patch.py .
+#   docker run --rm -it -v .\files:/files -w /files/3-rinkhals/opt/rinkhals/patches ghcr.io/rinkhals-community/rinkhals/build python3 ../scripts/create-patch.py .
 
 import os
 import json
@@ -9,6 +9,7 @@ import re
 import sys
 
 from pwn import context, ELF, asm, p32, util, enhex, u32
+context.arch = "arm"
 
 
 def read32(binary, address):
@@ -35,20 +36,23 @@ def getGoFunctions(binary):
     functions = {}
 
     for i in range(functionCount):
+        try:
+            addressOffset = read32(binary, functionTable + i * 8)
+            address = textStart + addressOffset
 
-        addressOffset = read32(binary, functionTable + i * 8)
-        address = textStart + addressOffset
+            functionOffset = read32(binary, functionTable + i * 8 + 4)
+            function = functionTable + functionOffset
 
-        functionOffset = read32(binary, functionTable + i * 8 + 4)
-        function = functionTable + functionOffset
+            nameOffset = read32(binary, function + 4)
+            name = functionNameTable + nameOffset
 
-        nameOffset = read32(binary, function + 4)
-        name = functionNameTable + nameOffset
+            bytes = binary.read(name, 1024)
+            name = bytes[:bytes.find(0)].decode('utf-8')
 
-        bytes = binary.read(name, 1024)
-        name = bytes[:bytes.find(0)].decode('utf-8')
+            functions[address] = name
 
-        functions[address] = name
+        except:
+            break
 
     with open(cachePath, 'w') as f:
         f.write(json.dumps(functions))
@@ -78,16 +82,21 @@ def patch_K3SysUi(binaryPath, modelCode, version):
     # Find the right patch / jump location
     # - In Ghidra, find connect<...AcXPageUiInit...> or a BtnRelease callback
     #   K2P / 3.1.2.3 - Settings > Support (5th button)
-    
-    #   KS1 / 2.4.8.3 - Settings > General > Service Support (4th button)
 
     patchJumpOperand = 'b'
+    s1RowRegister = 'r3'
+    s1CaseAlreadySelected = False
 
     if modelCode == 'K2P' and version == '3.1.2.3':
         buttonCallback = k3sysui.symbols['_ZN10MainWindow23AcSettingListBtnReleaseEi']
         patchJumpAddress = 0x99cb8
         patchJumpOperand = 'beq'
         patchReturnAddress = 0x99ce8
+    elif modelCode == 'K2P' and version == '3.1.4':
+        buttonCallback = k3sysui.symbols['_ZN10MainWindow23AcSettingListBtnReleaseEi']
+        patchJumpAddress = 0x8c4ac
+        patchJumpOperand = 'beq'
+        patchReturnAddress = 0x8c528
 
     # K3 - Settings > Support (5th button)
 
@@ -125,6 +134,18 @@ def patch_K3SysUi(binaryPath, modelCode, version):
         buttonCallback = k3sysui.symbols['_ZZN10MainWindow19AcSettingPageUiInitEvENKUlvE_clEv']
         patchJumpAddress = 0xf1c98
         patchReturnAddress = 0xf1cc4
+    elif (modelCode == 'K3' and version == '2.4.4.7') or (modelCode == 'K3M' and version == '2.5.1.3') or (modelCode == 'K3V2' and version == '1.1.0.1'):
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow19AcSettingPageUiInitEvENKUlvE_clEv']
+        patchJumpAddress = 0x103528
+        patchReturnAddress = 0x103558
+    elif (modelCode == 'K3' and version == '2.4.5') or (modelCode == 'K3M' and version == '2.5.1.7') or (modelCode == 'K3V2' and version == '1.1.0.4'):
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow19AcSettingPageUiInitEvENKUlvE_clEv']
+        patchJumpAddress = 0x103558
+        patchReturnAddress = 0x103588
+    elif (modelCode == 'K3M' and version == '2.5.2.8') or (modelCode == 'K3V2' and (version == '1.1.2.7' or version == '1.1.2.8')):
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow19AcSettingPageUiInitEvENKUlvE_clEv']
+        patchJumpAddress = 0x1076ec
+        patchReturnAddress = 0x10772c
 
     # KS1 - Settings > General > Service Support (4th button)
     
@@ -163,6 +184,48 @@ def patch_K3SysUi(binaryPath, modelCode, version):
         buttonCallback = k3sysui.symbols['_ZZN10MainWindow26AcSettingGeneralPageUiInitEvENKUlRK11QModelIndexE0_clES2_']
         patchJumpAddress = 0x12b04c
         patchReturnAddress = 0x12b054
+    elif modelCode == 'KS1' and (version == '2.5.9.9' or version == '2.6.0.0'):
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        patchJumpAddress = 0x14a51c
+        patchReturnAddress = 0x14a524
+        s1RowRegister = 'r1'
+    elif modelCode == 'KS1' and version == '2.7.0.7':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        # In 2.7.0.7 the actual Service Support case body starts at 0x14e870.
+        # The NOPs at 0x14e890 are after the original case-3 page switch.
+        patchJumpAddress = 0x14e870
+        patchReturnAddress = 0x14e89c
+        s1CaseAlreadySelected = True
+    elif modelCode == 'KS1' and version == '2.7.0.9':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        # In 2.7.0.9, case 3 (Service Support) begins at 0x14f5b0.
+        # The switch break target (cleanup/epilog) is at 0x14f674.
+        patchJumpAddress = 0x14f5b0
+        patchReturnAddress = 0x14f674
+        s1CaseAlreadySelected = True
+    elif modelCode == 'KS1' and version == '2.7.2.1':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        patchJumpAddress = 0x150b38
+        patchReturnAddress = 0x150bfc
+        s1CaseAlreadySelected = True
+
+    elif modelCode == 'KS1M' and version == '2.1.6':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        patchJumpAddress = 0x14a514
+        patchReturnAddress = 0x14a51c
+        s1RowRegister = 'r1'
+    elif modelCode == 'KS1M' and version == '2.6.6':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        patchJumpAddress = 0x14efc0
+        patchReturnAddress = 0x14efec
+        s1CaseAlreadySelected = True
+    elif modelCode == 'KS1M' and version == '2.6.9.3':
+        buttonCallback = k3sysui.symbols['_ZZN10MainWindow21AcSettingDeviceUiInitEvENKUlRK11QModelIndexE0_clES2_']
+        # In 2.6.9.3 the Support entry now routes through a warning popup path.
+        # Hook that case directly to bypass the popup and open Rinkhals instead.
+        patchJumpAddress = 0x150b30
+        patchReturnAddress = 0x150bd4
+        s1CaseAlreadySelected = True
 
     else:
         raise Exception('Unsupported model and version')
@@ -219,7 +282,7 @@ def patch_K3SysUi(binaryPath, modelCode, version):
     
     if modelCode == 'K3' or modelCode == 'K3M' or modelCode == 'K3V2':
         acDisplayWaitHide = k3sysui.symbols['_ZN10MainWindow17AcDisplayWaitHideEv']
-    elif modelCode == 'KS1':
+    elif modelCode == 'KS1' or modelCode == 'KS1M':
         acDisplayWaitHide = k3sysui.symbols['_ZN10MainWindow17AcDisplayWaitHideEh']
     elif modelCode == 'K2P':
         acDisplayWaitHide = acDisplayWaitHandler
@@ -245,10 +308,10 @@ def patch_K3SysUi(binaryPath, modelCode, version):
     address = address - address % 4
     k3sysui.asm(patchJumpAddress, f'{patchJumpOperand} 0x{address:x}')
     
-    if modelCode == 'KS1':
+    if (modelCode == 'KS1' or modelCode == 'KS1M') and not s1CaseAlreadySelected:
         # if (row() != 3) return
-        k3sysui.asm(address + 0,  'mov r0, r4')
-        k3sysui.asm(address + 4,  'cmp r3, #0x3')
+        k3sysui.asm(address + 0, 'mov r0, r4')
+        k3sysui.asm(address + 4, f'cmp {s1RowRegister}, #0x3')
         k3sysui.asm(address + 8, f'bne 0x{(patchReturnAddress - 4):x}')
         address = address + 12
 
@@ -369,10 +432,29 @@ def patch_gkapi(binaryPath, modelCode, version):
     ################
     # Open MQTT broker to the outside
 
-    brokerAddress = next(gkapi.search(b'127.0.0.1:2883'), None)
-    if brokerAddress:
-        gkapi.write(brokerAddress, b'0.0.0.0:002883')
+    # brokerAddress = next(gkapi.search(b'127.0.0.1:2883'), None)
+    # if brokerAddress:
+    #     gkapi.write(brokerAddress, b'0.0.0.0:002883')
 
+
+    ################
+    # Change orcaSim (Octoprint compat API) to port 71
+    # - We replace the reference to :80 by a reference to :71 (from localhost:7125)
+
+    moonrakerAddress = next(gkapi.search(b'localhost:7125'), None)
+    if moonrakerAddress:
+        orcaSimStart = functionsByName.get('printerApi/service/orcaSim.Start')
+
+        moonrakerOffset = None
+        for i in range(200):
+            moonrakerReference = read32(gkapi, orcaSimStart + 4 * i)
+            if moonrakerReference == moonrakerAddress:
+                moonrakerOffset = i * 4
+                break
+
+        if moonrakerOffset:
+            gkapi.write(orcaSimStart + moonrakerOffset - 4, p32(moonrakerAddress + 9))
+        
 
     ################
     # Patch calls to printerApi/common/config.LanPrintIsOpen
@@ -380,68 +462,65 @@ def patch_gkapi(binaryPath, modelCode, version):
     # - Force SSDP discovery
     # - Try to force AI detection startup
 
-    lanModeReplacementTargets = {}
-    # lanModeReplacementTargets = {
-    #     # SSDP, safe patches
-    #     'printerApi/service/ssdp.(*ssdp).Advertise': [ True ],
-    #     'printerApi/service/ssdp.(*HttpServer).Run.(*HttpServer).handleInfoWrapper.func2': [ True ],
-    #     'printerApi/service/ssdp.(*HttpServer).Run.(*HttpServer).handleCtrlWrapper.func3': [ True ],
-    #     'printerApi/service/ssdp.(*HttpServer).handleGcodeUpload': [ True ],
+    if False:
+        lanModeReplacementTargets = {}
+        # lanModeReplacementTargets = {
+        #     # SSDP, safe patches
+        #     'printerApi/service/ssdp.(*ssdp).Advertise': [ True ],
+        #     'printerApi/service/ssdp.(*HttpServer).Run.(*HttpServer).handleInfoWrapper.func2': [ True ],
+        #     'printerApi/service/ssdp.(*HttpServer).Run.(*HttpServer).handleCtrlWrapper.func3': [ True ],
+        #     'printerApi/service/ssdp.(*HttpServer).handleGcodeUpload': [ True ],
 
-    #     # To start the MQTT broker
-    #     'main.main': [ True ],
+        #     # To start the MQTT broker
+        #     'main.main': [ True ],
 
-    #     # Control LAN vs Cloud
-    #     'printerApi/common/config.GetDeviceUnionid': [ True ],
-    #     'printerApi/cloud.(*Cloud).Connect': [ True ],
+        #     # Control LAN vs Cloud
+        #     'printerApi/common/config.GetDeviceUnionid': [ True ],
+        #     'printerApi/cloud.(*Cloud).Connect': [ True ],
 
-    #     #'printerApi/cloud.(*printerHandler).runAIDetect': [ False ],
-    #     #'printerApi/cloud.(*printerHandler).handleUIResumePrintEvent': [ False ],
-    #     #'printerApi/cloud.(*printerHandler).localtask': [ True ],
-    #     #'printerApi/cloud.ReportCloudConnectState': [ False ],
-    #     #'0x56c8f4': [ True ], # ?
-    # }
+        #     #'printerApi/cloud.(*printerHandler).runAIDetect': [ False ],
+        #     #'printerApi/cloud.(*printerHandler).handleUIResumePrintEvent': [ False ],
+        #     #'printerApi/cloud.(*printerHandler).localtask': [ True ],
+        #     #'printerApi/cloud.ReportCloudConnectState': [ False ],
+        #     #'0x56c8f4': [ True ], # ?
+        # }
 
-    lanPrintIsOpen = functionsByName['printerApi/common/config.LanPrintIsOpen']
+        lanPrintIsOpen = functionsByName['printerApi/common/config.LanPrintIsOpen']
 
-    for name, patches in lanModeReplacementTargets.items():
-        address = functionsByName.get(name)
-        if not address:
-            address = int(name, 16)
+        for name, patches in lanModeReplacementTargets.items():
+            address = functionsByName.get(name)
+            if not address:
+                address = int(name, 16)
 
-        for p in patches:
-            while True:
-                address += 4
+            for p in patches:
+                while True:
+                    address += 4
 
-                instruction = gkapi.read(address, 4)
-                if instruction[3] != 0xeb:
-                    continue
+                    instruction = gkapi.read(address, 4)
+                    if instruction[3] != 0xeb:
+                        continue
 
-                blInstruction = asm(f'bl 0x{lanPrintIsOpen:x}', vma = address)
-                if instruction == blInstruction:
-                    # Then look for those instructions
-                    #   cmp r0, #0x0
-                    #   beq ? / bne ?
+                    blInstruction = asm(f'bl 0x{lanPrintIsOpen:x}', vma = address)
+                    if instruction == blInstruction:
+                        # Then look for those instructions
+                        #   cmp r0, #0x0
+                        #   beq ? / bne ?
 
-                    for i in range(20):
-                        instruction = gkapi.read(address + i * 4, 4)
-                        if instruction[3] != 0x0a and instruction[3] != 0x1a: # beq or bne
-                            continue
+                        for i in range(20):
+                            instruction = gkapi.read(address + i * 4, 4)
+                            if instruction[3] != 0x0a and instruction[3] != 0x1a: # beq or bne
+                                continue
 
-                        logic = instruction[3] == 0x1a # bne
+                            logic = instruction[3] == 0x1a # bne
 
-                        # Patch accordingly
-                        if p == logic:
-                            gkapi.write(address + i * 4 + 3, b'\xea') # b
-                        else:
-                            gkapi.asm(address + i * 4, 'nop')
+                            # Patch accordingly
+                            if p == logic:
+                                gkapi.write(address + i * 4 + 3, b'\xea') # b
+                            else:
+                                gkapi.asm(address + i * 4, 'nop')
 
+                            break
                         break
-                    break
-
-    # Test patch
-    #gkapi.asm(0x5b6954, 'nop')
-    #gkapi.asm(0x5b6cd4, 'b 0x5b6cfc')
 
     gkapi.save(binaryPath + '.patch')
 
@@ -454,6 +533,9 @@ def create_patch_script(beforePath, afterPath, scriptPath):
     beforeMd5 = enhex(beforeMd5)
     afterMd5 = util.hashes.md5file(afterPath)
     afterMd5 = enhex(afterMd5)
+    
+    if beforeMd5 == afterMd5:
+        return
 
     command = f'cmp -l {beforePath} {afterPath}'
     cmp = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
@@ -516,9 +598,9 @@ def main_file(path, model, version):
     fileName = os.path.basename(path)
     print(f'Patching {fileName} for {model} {version}')
 
-    # if 'gkapi' in fileName:
-    #     patch_gkapi(path, model, version)
-    #     create_patch_script(path, f'{path}.patch', f'{path}.sh')
+    if 'gkapi' in fileName:
+        patch_gkapi(path, model, version)
+        create_patch_script(path, f'{path}.patch', f'{path}.sh')
     if 'K3SysUi' in fileName:
         patch_K3SysUi(path, model, version)
         create_patch_script(path, f'{path}.patch', f'{path}.sh')
@@ -527,7 +609,7 @@ def main_file(path, model, version):
 def main_directory(path):
     files = os.listdir(path)
     for file in files:
-        match = re.search('^([a-zA-Z0-9]+)\.(K[A-Z0-9]+)_([0-9.]+)$', file)
+        match = re.search(r'^([a-zA-Z0-9]+)\.(K[A-Z0-9]+)_([0-9.]+)$', file)
         if not match:
             continue
 
@@ -557,7 +639,7 @@ def main():
             model = os.getenv('KOBRA_MODEL_CODE')
             version = os.getenv('KOBRA_VERSION')
 
-            match = re.search('^([a-zA-Z0-9]+)\.(K[A-Z0-9]+)_([0-9.]+)$', os.path.basename(path))
+            match = re.search(r'^([a-zA-Z0-9]+)\.(K[A-Z0-9]+)_([0-9.]+)$', os.path.basename(path))
             if match:
                 model = match.group(2)
                 version = match.group(3)

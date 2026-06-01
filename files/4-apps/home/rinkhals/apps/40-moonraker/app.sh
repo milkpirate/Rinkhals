@@ -28,7 +28,11 @@ debug() {
     . bin/activate
 
     cp -rf kobra.py moonraker/moonraker/components/kobra.py
+    cp -rf mmu_ace.py moonraker/moonraker/components/mmu_ace.py
+    cp -rf mmu_ace_metadata.py moonraker/moonraker/components/mmu_ace_metadata.py
     python /opt/rinkhals/scripts/process-cfg.py moonraker.conf > /userdata/app/gk/printer_data/config/moonraker.generated.conf
+    mkdir -p /userdata/app/gk/printer_data/logs
+    chmod 777 /userdata/app/gk/printer_data/logs
     TMPDIR=/useremain/tmp HOME=/userdata/app/gk python ./moonraker/moonraker/moonraker.py -c /userdata/app/gk/printer_data/config/moonraker.generated.conf $@
 }
 stop() {
